@@ -5,6 +5,19 @@ import taxonomy
 from supabase import create_client, Client
 from google import genai
 
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.title("🔒 Recruiter OS Login")
+    pwd = st.text_input("Enter Password", type="password")
+    if pwd == st.secrets["APP_PASSWORD"]:
+        st.session_state.authenticated = True
+        st.rerun()
+    elif pwd:
+        st.error("Access Denied")
+    st.stop()
+
 # --- 1. INTERNAL CONFIGURATION (Hardcoded) ---
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
