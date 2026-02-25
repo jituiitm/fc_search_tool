@@ -1,10 +1,12 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import math
 import taxonomy 
 from supabase import create_client, Client
 from google import genai
 
+# --- 1. SECURITY & AUTHENTICATION ---
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
@@ -18,11 +20,11 @@ if not st.session_state.authenticated:
         st.error("Access Denied")
     st.stop()
 
-# --- 1. INTERNAL CONFIGURATION (Hardcoded) ---
+# --- 2. CONFIGURATION ---
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
-# ⚡ AI MODEL CONFIG
+
 AI_MODEL = "gemini-2.0-flash" 
 PAGE_SIZE = 50 
 
@@ -33,9 +35,7 @@ def init_clients():
 supabase, gemini_client = init_clients()
 
 # --- DATABASE ACTIONS ---
-
 def delete_candidate(c_id):
-    """Delete a candidate permanently."""
     try:
         supabase.table("candidates").delete().eq("id", c_id).execute()
         st.toast(f"Candidate {c_id} deleted successfully!", icon="🗑️")
@@ -44,71 +44,43 @@ def delete_candidate(c_id):
         st.error(f"Error deleting: {e}")
 
 def get_candidates(filters=None, list_id=None, page=1):
-    """Fetch candidates with filters, pagination, and total count."""
-    
-    # Start Query with Count
     query = supabase.table("candidates").select("*", count="exact")
     
-    # MODE A: Fetch by Custom List
     if list_id:
         relations = supabase.table("list_candidates").select("candidate_id").eq("list_id", list_id).execute().data
         if not relations: return [], 0
         ids = [r['candidate_id'] for r in relations]
         query = query.in_("id", ids)
-        
-    # MODE B: Search Filters
     elif filters:
-        # 1. Text Searches
-        if filters.get('name_search'):
-            query = query.ilike("full_name", f"%{filters['name_search']}%")
-        if filters.get('campaign_search'):
-            query = query.ilike("campaign_name", f"%{filters['campaign_search']}%")
-
-        # 2. Multi-Select Overlaps
+        if filters.get('name_search'): query = query.ilike("full_name", f"%{filters['name_search']}%")
+        if filters.get('campaign_search'): query = query.ilike("campaign_name", f"%{filters['campaign_search']}%")
         if filters['types']: query = query.overlaps("founder_types", filters['types'])
         if filters['funcs']: query = query.overlaps("functions_overseen", filters['funcs'])
         if filters['inds']: query = query.overlaps("industry_experience", filters['inds'])
         if filters['skills']: query = query.overlaps("skills", filters['skills'])
         if filters['roles']: query = query.overlaps("suitable_roles", filters['roles'])
         if filters['stages']: query = query.overlaps("startup_stage_experience", filters['stages'])
-        
-        # 3. Numeric Filters (Only Experience now)
         query = query.gte("total_experience", filters['min_exp'])
         query = query.gte("founder_experience_years", filters['min_founder_exp'])
-        
-        # 4. Location
         if filters['location']: query = query.ilike("current_location", f"%{filters['location']}%")
     
-    # PAGINATION LOGIC
     start = (page - 1) * PAGE_SIZE
     end = start + PAGE_SIZE - 1
-    query = query.range(start, end)
-    
-    # Sort by ID (Newest first)
-    query = query.order("id", desc=True)
+    query = query.range(start, end).order("id", desc=True)
     
     response = query.execute()
     return response.data, response.count
 
 def ask_ai_about_list(candidates, question):
-    """Sends the filtered list to AI for analysis."""
     if not candidates: return "List is empty."
+    context_text = "".join([f"- {c['full_name']} (ID:{c['id']}): {c['resume_summary']} [Tags: {c['founder_types']}, {c['skills']}]\n" for c in candidates])
     
-    context_text = ""
-    for c in candidates:
-        context_text += f"- {c['full_name']} (ID:{c['id']}): {c['resume_summary']} [Tags: {c['founder_types']}, {c['skills']}]\n"
-    
-    prompt = f"""
-    You are a Recruiting Analyst. You are looking at a filtered list of {len(candidates)} candidates.
+    prompt = f"""You are a Recruiting Analyst. You are looking at a filtered list of {len(candidates)} candidates.
     CANDIDATE DATA: {context_text}
     USER QUESTION: "{question}"
-    INSTRUCTIONS: Identify specific candidates match the question. Cite experience. Be concise.
-    """
+    INSTRUCTIONS: Identify specific candidates match the question. Cite experience. Be concise."""
     
-    response = gemini_client.models.generate_content(
-        model=AI_MODEL,
-        contents=prompt
-    )
+    response = gemini_client.models.generate_content(model=AI_MODEL, contents=prompt)
     return response.text
 
 # --- HELPER FUNCTIONS ---
@@ -126,7 +98,40 @@ def reset_page(): st.session_state.page = 1
 # --- UI LAYOUT ---
 st.set_page_config(page_title="Recruiter OS", layout="wide", page_icon="🕵️‍♂️")
 
-# SIDEBAR
+# --- SCROLL TO TOP INJECTION ---
+components.html(
+    """
+    <script>
+    const parent = window.parent.document;
+    if (!parent.getElementById("st-scroll-btn")) {
+        const btn = parent.createElement("button");
+        btn.id = "st-scroll-btn";
+        btn.innerHTML = "⬆️ Top";
+        btn.style.cssText = "display:none; position:fixed; bottom:40px; right:40px; z-index:99999; background:#2e2e38; color:white; border:1px solid #4a4a5a; border-radius:8px; padding:10px 15px; font-weight:bold; cursor:pointer; box-shadow:0 4px 6px rgba(0,0,0,0.3); transition: background 0.2s;";
+        
+        btn.onclick = () => {
+            const scrollContainer = parent.querySelector('.stAppViewMain') || parent.documentElement;
+            scrollContainer.scrollTo({top: 0, behavior: 'smooth'});
+        };
+        
+        parent.body.appendChild(btn);
+        
+        parent.addEventListener('scroll', (e) => {
+            if (e.target.scrollHeight > e.target.clientHeight) {
+                const scrollPct = e.target.scrollTop / (e.target.scrollHeight - e.target.clientHeight);
+                if (scrollPct >= 0.5) {
+                    btn.style.display = "block";
+                } else {
+                    btn.style.display = "none";
+                }
+            }
+        }, true);
+    }
+    </script>
+    """, height=0, width=0
+)
+
+# --- SIDEBAR ---
 st.sidebar.title("🕵️‍♂️ Recruiter OS")
 view_mode = st.sidebar.radio("Navigation", ["🔍 Search Candidates", "📂 Saved Lists"], on_change=reset_page)
 
@@ -135,34 +140,29 @@ selected_list_id = None
 
 if view_mode == "🔍 Search Candidates":
     st.sidebar.divider()
-    
-    # 1. TEXT SEARCHES
     name_search = st.sidebar.text_input("👤 Name Search", placeholder="Type name...", on_change=reset_page)
     campaign_search = st.sidebar.text_input("🏷️ Campaign Search", placeholder="Ex: Gynoveda...", on_change=reset_page)
     
     st.sidebar.header("Filters")
-    # 2. DROPDOWNS
     sel_types = st.sidebar.multiselect("Founder Type", taxonomy.FOUNDER_TYPES, on_change=reset_page)
     sel_roles = st.sidebar.multiselect("Suitable Roles", taxonomy.SUITABLE_ROLES, on_change=reset_page)
     sel_funcs = st.sidebar.multiselect("Functions", taxonomy.FUNCTIONS, on_change=reset_page)
     sel_inds = st.sidebar.multiselect("Industry", taxonomy.INDUSTRIES, on_change=reset_page)
     sel_skills = st.sidebar.multiselect("Skills", taxonomy.SKILLS, on_change=reset_page)
     
-    # Removed CTC Slider from here
     min_exp = st.sidebar.slider("Total Exp (Yrs)", 0, 25, 0, on_change=reset_page)
     min_found = st.sidebar.slider("Founder Exp (Yrs)", 0, 10, 0, on_change=reset_page)
     loc_search = st.sidebar.text_input("Location", on_change=reset_page)
 
     filters = {
-        "name_search": name_search,
-        "campaign_search": campaign_search,
+        "name_search": name_search, "campaign_search": campaign_search,
         "types": sel_types, "roles": sel_roles, "funcs": sel_funcs,
         "inds": sel_inds, "skills": sel_skills, "stages": [],
         "min_exp": min_exp, "min_founder_exp": min_found, "location": loc_search
     }
     st.subheader("🔍 Search Results")
 
-else: # List Mode
+else:
     st.sidebar.divider()
     st.sidebar.header("My Lists")
     new_list = st.sidebar.text_input("New List Name")
@@ -190,18 +190,16 @@ if candidates:
     for c in candidates:
         camp_name = c.get('campaign_name') or "General"
         
-        with st.expander(f"🆔 {c['id']} | {c['full_name']} | 🏷️ {camp_name}"):
+        # Expanders default to open
+        with st.expander(f"🆔 {c['id']} | {c['full_name']} | 🏷️ {camp_name}", expanded=True):
             
             # Row 1: Contact
             c1, c2, c3 = st.columns([2, 2, 1])
             with c1:
                 st.markdown(f"**Email:** `{c['email']}`")
                 st.markdown(f"**Phone:** `{c['phone']}`")
-                
-                # We KEEP the display here, just removed the filter
                 ctc_display = f"{c['current_ctc_lakhs']} LPA" if c.get('current_ctc_lakhs') else "N/A"
                 st.caption(f"📍 {c['current_location']} | 💰 {ctc_display} | 📅 {c['applied_date']}")
-                
             with c2:
                 if c['linkedin_url']: st.markdown(f"🔗 [LinkedIn Profile]({c['linkedin_url']})")
                 if c['resume_url']: st.markdown(f"📄 [Resume PDF]({c['resume_url']})")
@@ -217,15 +215,15 @@ if candidates:
 
             st.divider()
             
-            # Row 2: Data
+            # Row 2: Data (Null-safe)
             m1, m2 = st.columns([1, 1])
             with m1:
-                st.write(f"**Roles:** {c['suitable_roles']}")
-                st.write(f"**Industry:** {c['industry_experience']}")
-                st.info(f"**🤖 Evidence:** {c.get('taxonomy_evidence', 'N/A')}")
+                st.write(f"**Roles:** {c.get('suitable_roles') or []}")
+                st.write(f"**Industry:** {c.get('industry_experience') or []}")
             with m2:
-                st.write(f"**Skills:** {c['skills']}")
-                st.write(f"**Summary:** {c['resume_summary']}")
+                st.write(f"**Skills:** {c.get('skills') or []}")
+            
+            st.info(f"**📄 Summary:** {c.get('resume_summary', 'No summary available.')}")
 
             st.divider()
             
@@ -239,9 +237,9 @@ if candidates:
                 with st.popover("✏️ Edit Data"):
                     with st.form(key=f"edit_{c['id']}"):
                         st.write(f"Editing: {c['full_name']}")
-                        n_roles = st.multiselect("Roles", taxonomy.SUITABLE_ROLES, default=[x for x in c.get('suitable_roles', []) if x in taxonomy.SUITABLE_ROLES])
-                        n_inds = st.multiselect("Industries", taxonomy.INDUSTRIES, default=[x for x in c.get('industry_experience', []) if x in taxonomy.INDUSTRIES])
-                        n_types = st.multiselect("Types", taxonomy.FOUNDER_TYPES, default=[x for x in c.get('founder_types', []) if x in taxonomy.FOUNDER_TYPES])
+                        n_roles = st.multiselect("Roles", taxonomy.SUITABLE_ROLES, default=[x for x in (c.get('suitable_roles') or []) if x in taxonomy.SUITABLE_ROLES])
+                        n_inds = st.multiselect("Industries", taxonomy.INDUSTRIES, default=[x for x in (c.get('industry_experience') or []) if x in taxonomy.INDUSTRIES])
+                        n_types = st.multiselect("Types", taxonomy.FOUNDER_TYPES, default=[x for x in (c.get('founder_types') or []) if x in taxonomy.FOUNDER_TYPES])
                         if st.form_submit_button("Save"):
                             update_candidate(c['id'], {"suitable_roles": n_roles, "industry_experience": n_inds, "founder_types": n_types})
 
