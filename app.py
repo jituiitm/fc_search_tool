@@ -3,21 +3,27 @@ import streamlit.components.v1 as components
 import pandas as pd
 import math
 import taxonomy 
-from supabase import create_client, Client
+import datetime
+from supabase import create_client, Client, ClientOptions
 from google import genai
 
-# --- 1. SECURITY & AUTHENTICATION ---
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
+# --- 1. SECURITY & AUTHENTICATION (RBAC) ---
+if "user_role" not in st.session_state:
+    st.session_state.user_role = None
 
-if not st.session_state.authenticated:
+if not st.session_state.user_role:
     st.title("🔒 Recruiter OS Login")
     pwd = st.text_input("Enter Password", type="password")
-    if pwd == st.secrets["APP_PASSWORD"]:
-        st.session_state.authenticated = True
-        st.rerun()
-    elif pwd:
-        st.error("Access Denied")
+    
+    if pwd:
+        if pwd == st.secrets.get("ADMIN_PASSWORD"):
+            st.session_state.user_role = "admin"
+            st.rerun()
+        elif pwd == st.secrets.get("DEMO_PASSWORD"):
+            st.session_state.user_role = "demo"
+            st.rerun()
+        else:
+            st.error("Access Denied")
     st.stop()
 
 # --- 2. CONFIGURATION ---
@@ -30,9 +36,35 @@ PAGE_SIZE = 50
 
 @st.cache_resource
 def init_clients():
-    return create_client(SUPABASE_URL, SUPABASE_KEY), genai.Client(api_key=GEMINI_API_KEY)
+    opts = ClientOptions(postgrest_client_timeout=60.0)
+    return create_client(SUPABASE_URL, SUPABASE_KEY, options=opts), genai.Client(api_key=GEMINI_API_KEY)
 
 supabase, gemini_client = init_clients()
+
+# --- DEMO USAGE TRACKING ---
+def is_ai_allowed():
+    if st.session_state.user_role == "admin": return True, ""
+    
+    # Limit demo to 5 chats per hour
+    one_hour_ago = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)).isoformat()
+    try:
+        usage = supabase.table("usage_logs").select("id", count="exact").eq("user_role", "demo").eq("action_type", "chat").gt("created_at", one_hour_ago).execute()
+        count = usage.count if usage.count is not None else 0
+        limit = 5 
+        if count >= limit: return False, f"Demo limit reached ({limit} chats/hour). Try again later."
+    except Exception: pass
+    return True, ""
+
+def log_ai_usage():
+    if st.session_state.user_role == "demo":
+        try: supabase.table("usage_logs").insert({"user_role": "demo", "action_type": "chat"}).execute()
+        except Exception: pass
+
+@st.cache_data(ttl=3600)
+def get_demo_allowed_ids():
+    # Cache the IDs of the first 50 candidates so the demo user is sandboxed
+    res = supabase.table("candidates").select("id").order("id", desc=False).limit(50).execute()
+    return [r['id'] for r in res.data]
 
 # --- DATABASE ACTIONS ---
 def delete_candidate(c_id):
@@ -40,16 +72,23 @@ def delete_candidate(c_id):
         supabase.table("candidates").delete().eq("id", c_id).execute()
         st.toast(f"Candidate {c_id} deleted successfully!", icon="🗑️")
         st.rerun()
-    except Exception as e:
-        st.error(f"Error deleting: {e}")
+    except Exception as e: st.error(f"Error deleting: {e}")
 
 def get_candidates(filters=None, list_id=None, page=1):
-    query = supabase.table("candidates").select("*", count="exact")
+    safe_columns = "id, created_at, full_name, email, phone, linkedin_url, resume_url, source, applied_date, current_location, current_ctc_lakhs, total_experience, founder_experience_years, startup_experience_years, founder_types, seniority_level, functions_overseen, skills, industry_experience, startup_stage_experience, suitable_roles, resume_summary, taxonomy_evidence, campaign_name"
+    query = supabase.table("candidates").select(safe_columns, count="exact")
+    
+    # 🛡️ Apply Demo Sandbox
+    if st.session_state.user_role == "demo":
+        demo_ids = get_demo_allowed_ids()
+        if not demo_ids: return [], 0
+        query = query.in_("id", demo_ids)
     
     if list_id:
         relations = supabase.table("list_candidates").select("candidate_id").eq("list_id", list_id).execute().data
         if not relations: return [], 0
         ids = [r['candidate_id'] for r in relations]
+        if st.session_state.user_role == "demo": ids = [i for i in ids if i in get_demo_allowed_ids()]
         query = query.in_("id", ids)
     elif filters:
         if filters.get('name_search'): query = query.ilike("full_name", f"%{filters['name_search']}%")
@@ -97,6 +136,10 @@ def reset_page(): st.session_state.page = 1
 
 # --- UI LAYOUT ---
 st.set_page_config(page_title="Recruiter OS", layout="wide", page_icon="🕵️‍♂️")
+
+# Display Demo Badge
+if st.session_state.user_role == "demo":
+    st.warning("⚠️ **Demo Mode Active:** You are viewing a limited sandbox of 50 candidates. AI Chat is limited.")
 
 # --- SCROLL TO TOP INJECTION ---
 components.html(
@@ -165,8 +208,11 @@ if view_mode == "🔍 Search Candidates":
 else:
     st.sidebar.divider()
     st.sidebar.header("My Lists")
-    new_list = st.sidebar.text_input("New List Name")
-    if st.sidebar.button("Create List"): create_list(new_list)
+    
+    # Hide Create List for Demo
+    if st.session_state.user_role == "admin":
+        new_list = st.sidebar.text_input("New List Name")
+        if st.sidebar.button("Create List"): create_list(new_list)
     
     my_lists = get_lists()
     if not my_lists: st.info("No lists yet."); st.stop()
@@ -181,92 +227,109 @@ candidates, total_count = get_candidates(filters=filters, list_id=selected_list_
 
 # --- RESULTS DISPLAY ---
 if candidates:
-    total_pages = math.ceil(total_count / PAGE_SIZE)
+    total_pages = math.ceil(total_count / PAGE_SIZE) if total_count > 0 else 1
     st.caption(f"Showing {len(candidates)} of {total_count} candidates | Page {st.session_state.page} of {total_pages}")
     
     all_lists = get_lists()
     list_lookup = {l['name']: l['id'] for l in all_lists}
 
-    for c in candidates:
-        camp_name = c.get('campaign_name') or "General"
-        
-        # Expanders default to open
-        with st.expander(f"🆔 {c['id']} | {c['full_name']} | 🏷️ {camp_name}", expanded=True):
-            
-            # Row 1: Contact
-            c1, c2, c3 = st.columns([2, 2, 1])
-            with c1:
-                st.markdown(f"**Email:** `{c['email']}`")
-                st.markdown(f"**Phone:** `{c['phone']}`")
-                ctc_display = f"{c['current_ctc_lakhs']} LPA" if c.get('current_ctc_lakhs') else "N/A"
-                st.caption(f"📍 {c['current_location']} | 💰 {ctc_display} | 📅 {c['applied_date']}")
-            with c2:
-                if c['linkedin_url']: st.markdown(f"🔗 [LinkedIn Profile]({c['linkedin_url']})")
-                if c['resume_url']: st.markdown(f"📄 [Resume PDF]({c['resume_url']})")
-                st.caption(f"**Source:** {c.get('source', 'Unknown')} | **Campaign:** {camp_name}")
-            with c3:
-                if view_mode == "🔍 Search Candidates":
-                    target = st.selectbox("Add to:", ["Select..."] + list(list_lookup.keys()), key=f"add_sel_{c['id']}")
-                    if target != "Select..." and st.button("Add", key=f"btn_add_{c['id']}"):
-                        add_to_list(list_lookup[target], c['id'])
-                else:
-                    if st.button("❌ Remove", key=f"btn_rem_{c['id']}"):
-                        remove_from_list(selected_list_id, c['id'])
-
-            st.divider()
-            
-            # Row 2: Data (Null-safe)
-            m1, m2 = st.columns([1, 1])
-            with m1:
-                st.write(f"**Roles:** {c.get('suitable_roles') or []}")
-                st.write(f"**Industry:** {c.get('industry_experience') or []}")
-            with m2:
-                st.write(f"**Skills:** {c.get('skills') or []}")
-            
-            st.info(f"**📄 Summary:** {c.get('resume_summary', 'No summary available.')}")
-
-            st.divider()
-            
-            # Row 3: Admin
-            b1, b2 = st.columns([1, 5])
-            with b1:
-                with st.popover("🗑️ Delete"):
-                    st.write("Are you sure?")
-                    if st.button("Confirm", key=f"del_{c['id']}", type="primary"): delete_candidate(c['id'])
-            with b2:
-                with st.popover("✏️ Edit Data"):
-                    with st.form(key=f"edit_{c['id']}"):
-                        st.write(f"Editing: {c['full_name']}")
-                        n_roles = st.multiselect("Roles", taxonomy.SUITABLE_ROLES, default=[x for x in (c.get('suitable_roles') or []) if x in taxonomy.SUITABLE_ROLES])
-                        n_inds = st.multiselect("Industries", taxonomy.INDUSTRIES, default=[x for x in (c.get('industry_experience') or []) if x in taxonomy.INDUSTRIES])
-                        n_types = st.multiselect("Types", taxonomy.FOUNDER_TYPES, default=[x for x in (c.get('founder_types') or []) if x in taxonomy.FOUNDER_TYPES])
-                        if st.form_submit_button("Save"):
-                            update_candidate(c['id'], {"suitable_roles": n_roles, "industry_experience": n_inds, "founder_types": n_types})
-
-    # --- PAGINATION ---
-    st.divider()
-    col_prev, col_info, col_next = st.columns([1, 2, 1])
-    with col_prev:
-        if st.session_state.page > 1 and st.button("⬅️ Previous"): st.session_state.page -= 1; st.rerun()
-    with col_info:
-        st.markdown(f"<div style='text-align: center'>Page <b>{st.session_state.page}</b> of <b>{total_pages}</b></div>", unsafe_allow_html=True)
-    with col_next:
-        if st.session_state.page < total_pages and st.button("Next ➡️"): st.session_state.page += 1; st.rerun()
+    # 🌟 NEW: Split the screen layout! (65% candidates, 35% chat)
+    col_results, col_chat = st.columns([2, 1], gap="large")
     
-    # --- CHAT ---
-    st.divider()
-    st.subheader("🤖 Chat with this Page")
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]): st.write(msg["content"])
+    with col_results:
+        for c in candidates:
+            camp_name = c.get('campaign_name') or "General"
+            
+            with st.expander(f"🆔 {c['id']} | {c['full_name']} | 🏷️ {camp_name}", expanded=True):
+                
+                # Row 1: Contact
+                c1, c2, c3 = st.columns([2, 2, 1])
+                with c1:
+                    st.markdown(f"**Email:** `{c['email']}`")
+                    st.markdown(f"**Phone:** `{c['phone']}`")
+                    ctc_display = f"{c['current_ctc_lakhs']} LPA" if c.get('current_ctc_lakhs') else "N/A"
+                    st.caption(f"📍 {c['current_location']} | 💰 {ctc_display} | 📅 {c['applied_date']}")
+                with c2:
+                    if c['linkedin_url']: st.markdown(f"🔗 [LinkedIn Profile]({c['linkedin_url']})")
+                    if c['resume_url']: st.markdown(f"📄 [Resume PDF]({c['resume_url']})")
+                    st.caption(f"**Source:** {c.get('source', 'Unknown')} | **Campaign:** {camp_name}")
+                with c3:
+                    # Hide Add/Remove from lists for Demo users
+                    if st.session_state.user_role == "admin":
+                        if view_mode == "🔍 Search Candidates":
+                            target = st.selectbox("Add to:", ["Select..."] + list(list_lookup.keys()), key=f"add_sel_{c['id']}")
+                            if target != "Select..." and st.button("Add", key=f"btn_add_{c['id']}"):
+                                add_to_list(list_lookup[target], c['id'])
+                        else:
+                            if st.button("❌ Remove", key=f"btn_rem_{c['id']}"):
+                                remove_from_list(selected_list_id, c['id'])
 
-    if user_query := st.chat_input("Ask about these candidates..."):
-        st.session_state.messages.append({"role": "user", "content": user_query})
-        with st.chat_message("user"): st.write(user_query)
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                ai_response = ask_ai_about_list(candidates, user_query)
-                st.write(ai_response)
-        st.session_state.messages.append({"role": "assistant", "content": ai_response})
+                st.divider()
+                
+                # Row 2: Data 
+                m1, m2 = st.columns([1, 1])
+                with m1:
+                    st.write(f"**Roles:** {c.get('suitable_roles') or []}")
+                    st.write(f"**Industry:** {c.get('industry_experience') or []}")
+                with m2:
+                    st.write(f"**Skills:** {c.get('skills') or []}")
+                
+                st.info(f"**📄 Summary:** {c.get('resume_summary', 'No summary available.')}")
+
+                # Row 3: Admin Controls (Hidden for Demo)
+                if st.session_state.user_role == "admin":
+                    st.divider()
+                    b1, b2 = st.columns([1, 5])
+                    with b1:
+                        with st.popover("🗑️ Delete"):
+                            st.write("Are you sure?")
+                            if st.button("Confirm", key=f"del_{c['id']}", type="primary"): delete_candidate(c['id'])
+                    with b2:
+                        with st.popover("✏️ Edit Data"):
+                            with st.form(key=f"edit_{c['id']}"):
+                                st.write(f"Editing: {c['full_name']}")
+                                n_roles = st.multiselect("Roles", taxonomy.SUITABLE_ROLES, default=[x for x in (c.get('suitable_roles') or []) if x in taxonomy.SUITABLE_ROLES])
+                                n_inds = st.multiselect("Industries", taxonomy.INDUSTRIES, default=[x for x in (c.get('industry_experience') or []) if x in taxonomy.INDUSTRIES])
+                                n_types = st.multiselect("Types", taxonomy.FOUNDER_TYPES, default=[x for x in (c.get('founder_types') or []) if x in taxonomy.FOUNDER_TYPES])
+                                if st.form_submit_button("Save"):
+                                    update_candidate(c['id'], {"suitable_roles": n_roles, "industry_experience": n_inds, "founder_types": n_types})
+
+        # --- PAGINATION ---
+        st.divider()
+        col_prev, col_info, col_next = st.columns([1, 2, 1])
+        with col_prev:
+            if st.session_state.page > 1 and st.button("⬅️ Previous"): st.session_state.page -= 1; st.rerun()
+        with col_info:
+            st.markdown(f"<div style='text-align: center'>Page <b>{st.session_state.page}</b> of <b>{total_pages}</b></div>", unsafe_allow_html=True)
+        with col_next:
+            if st.session_state.page < total_pages and st.button("Next ➡️"): st.session_state.page += 1; st.rerun()
+    
+    # 🌟 NEW: The Sticky Chat Column
+    with col_chat:
+        st.subheader("🤖 Chat with Results")
+        
+        chat_container = st.container(height=650, border=False)
+        with chat_container:
+            for msg in st.session_state.messages:
+                with st.chat_message(msg["role"]): st.write(msg["content"])
+
+        if user_query := st.chat_input("Ask about these candidates..."):
+            
+            # Check Rate Limit before calling AI
+            allowed, message = is_ai_allowed()
+            if not allowed:
+                st.error(message)
+            else:
+                st.session_state.messages.append({"role": "user", "content": user_query})
+                with chat_container:
+                    with st.chat_message("user"): st.write(user_query)
+                    with st.chat_message("assistant"):
+                        with st.spinner("Thinking..."):
+                            ai_response = ask_ai_about_list(candidates, user_query)
+                            st.write(ai_response)
+                
+                st.session_state.messages.append({"role": "assistant", "content": ai_response})
+                log_ai_usage()
 
 else:
     st.info("No candidates found.")
